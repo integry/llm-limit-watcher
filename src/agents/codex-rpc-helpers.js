@@ -13,12 +13,20 @@ function formatRpcResponseAsOutput(rateLimits) {
     throw new Error('Empty rate limits response');
   }
 
-  // Check if we got a structured response we can use directly
+  // Current app-server responses include a backwards-compatible single bucket
+  // plus an optional map of model-specific buckets. Keep the entire response so
+  // the parser can use both views.
+  if (isRateLimitBucket(rateLimits) || isRateLimitBucket(rateLimits.rateLimits) ||
+      isObject(rateLimits.rateLimitsByLimitId)) {
+    return { marker: '__RPC_RESPONSE__', data: rateLimits };
+  }
+
+  // Legacy structured response.
   if (rateLimits.fiveHour || rateLimits.weekly || rateLimits.limits) {
     return { marker: '__RPC_RESPONSE__', data: rateLimits };
   }
 
-  // Handle different response formats
+  // Legacy nested response.
   if (rateLimits.rateLimits) {
     return { marker: '__RPC_RESPONSE__', data: rateLimits.rateLimits };
   }
@@ -39,13 +47,19 @@ function parseRpcRateLimits(rateLimits, context = {}) {
     weekly: null,
     version: context.versionInfo || null,
   };
+  const metadataUpdates = {};
 
-  // Parse five hour limit
+  if (isCurrentRateLimitsResponse(rateLimits)) {
+    parseCurrentRateLimits(rateLimits, usage, metadataUpdates, context);
+    return { usage, metadataUpdates };
+  }
+
+  // Parse legacy five hour limit.
   if (rateLimits.fiveHour) {
     usage.fiveHour = parseRpcLimitEntry(rateLimits.fiveHour, '5h limit', 'fiveHour', context);
   }
 
-  // Parse weekly limit
+  // Parse legacy weekly limit.
   if (rateLimits.weekly) {
     usage.weekly = parseRpcLimitEntry(rateLimits.weekly, 'Weekly limit', 'weekly', context);
   }
@@ -71,8 +85,6 @@ function parseRpcRateLimits(rateLimits, context = {}) {
     usage.account = rateLimits.account || rateLimits.email;
   }
 
-  // Build metadata updates
-  const metadataUpdates = {};
   if (rateLimits.model) {
     metadataUpdates.model = rateLimits.model;
   }
@@ -86,6 +98,89 @@ function parseRpcRateLimits(rateLimits, context = {}) {
   return { usage, metadataUpdates };
 }
 
+function parseCurrentRateLimits(rateLimits, usage, metadataUpdates, context) {
+  const bucketsById = isObject(rateLimits.rateLimitsByLimitId)
+    ? rateLimits.rateLimitsByLimitId
+    : {};
+  const mainBucket = findMainBucket(rateLimits, bucketsById);
+
+  if (mainBucket) {
+    Object.assign(usage, parseRateLimitBucket(mainBucket, context));
+    if (mainBucket.planType) metadataUpdates.planType = mainBucket.planType;
+  }
+
+  const modelLimits = parseModelLimitBuckets(bucketsById, mainBucket, context);
+  if (modelLimits.length > 0) usage.modelLimits = modelLimits;
+}
+
+function findMainBucket(rateLimits, bucketsById) {
+  if (isRateLimitBucket(rateLimits.rateLimits)) return rateLimits.rateLimits;
+  if (isRateLimitBucket(rateLimits)) return rateLimits;
+  if (isRateLimitBucket(bucketsById.codex)) return bucketsById.codex;
+  return Object.values(bucketsById).find(bucket =>
+    isRateLimitBucket(bucket) && !bucket.limitName
+  ) || null;
+}
+
+function parseModelLimitBuckets(bucketsById, mainBucket, context) {
+  const modelLimits = [];
+  for (const [limitId, bucket] of Object.entries(bucketsById)) {
+    if (isMainBucketEntry(bucket, limitId, mainBucket)) continue;
+
+    const parsed = parseRateLimitBucket(bucket, context);
+    if (!parsed.fiveHour && !parsed.weekly) continue;
+    modelLimits.push({
+      name: bucket.limitName || bucket.limitId || limitId,
+      ...parsed,
+    });
+  }
+  return modelLimits;
+}
+
+function isMainBucketEntry(bucket, limitId, mainBucket) {
+  if (!isRateLimitBucket(bucket) || bucket === mainBucket) return true;
+  return Boolean(mainBucket?.limitId && (bucket.limitId || limitId) === mainBucket.limitId);
+}
+
+function parseRateLimitBucket(bucket, context) {
+  const parsed = { fiveHour: null, weekly: null };
+  const windows = [
+    { data: bucket.primary, fallbackCycle: 'fiveHour' },
+    { data: bucket.secondary, fallbackCycle: 'weekly' },
+  ];
+
+  for (const { data, fallbackCycle } of windows) {
+    if (!isObject(data)) continue;
+    const cycle = classifyWindow(data.windowDurationMins) || fallbackCycle;
+    if (parsed[cycle]) continue;
+    const label = cycle === 'weekly' ? 'Weekly limit' : '5h limit';
+    parsed[cycle] = parseRpcLimitEntry(data, label, cycle, context);
+  }
+
+  return parsed;
+}
+
+function classifyWindow(windowDurationMins) {
+  const duration = Number(windowDurationMins);
+  if (!Number.isFinite(duration)) return null;
+  if (duration === CYCLE_DURATIONS.fiveHour / 60) return 'fiveHour';
+  if (duration === CYCLE_DURATIONS.weekly / 60) return 'weekly';
+  return null;
+}
+
+function isCurrentRateLimitsResponse(rateLimits) {
+  return isRateLimitBucket(rateLimits) || isRateLimitBucket(rateLimits?.rateLimits) ||
+    isObject(rateLimits?.rateLimitsByLimitId);
+}
+
+function isRateLimitBucket(value) {
+  return isObject(value) && ('primary' in value || 'secondary' in value);
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 /**
  * Parse a single limit entry from RPC response
  * @param {Object} limit - Limit data from RPC
@@ -95,48 +190,85 @@ function parseRpcRateLimits(rateLimits, context = {}) {
  * @returns {Object} - Parsed limit entry
  */
 function parseRpcLimitEntry(limit, label, cycleType, context = {}) {
-  // Handle different possible structures
-  const percentLeft = limit.percentLeft ?? limit.remaining ?? limit.percent ?? 100;
-  const percentUsed = 100 - percentLeft;
+  if (!isObject(limit)) return null;
 
-  // Handle reset time
-  let resetsAt = limit.resetsAt || limit.resetAt || limit.reset || null;
-  let resetsInSeconds = limit.resetsInSeconds || limit.secondsUntilReset || null;
-  let resetsIn = null;
-
-  // If we have seconds, calculate text
-  if (resetsInSeconds !== null) {
-    resetsIn = formatDuration(resetsInSeconds);
-  } else if (resetsAt && context.parseResetTime) {
-    // Try to parse the reset time
-    const resetData = context.parseResetTime(resetsAt);
-    if (resetData) {
-      resetsIn = resetData.text;
-      resetsInSeconds = resetData.seconds;
-    }
-  }
+  const percentages = parsePercentages(limit);
+  if (!percentages) return null;
+  const resetInfo = parseRpcResetInfo(limit, context);
 
   const entry = {
-    percentLeft,
-    resetsAt,
+    ...percentages,
+    resetsAt: resetInfo.resetsAt,
     label,
-    percentUsed,
-    resetsIn,
-    resetsInSeconds,
+    resetsIn: resetInfo.resetsIn,
+    resetsInSeconds: resetInfo.resetsInSeconds,
   };
+  if (limit.windowDurationMins != null) {
+    entry.windowDurationMins = limit.windowDurationMins;
+  }
 
   // Calculate pace if we have the necessary data
   const cycleDuration = CYCLE_DURATIONS[cycleType];
-  if (cycleDuration && resetsInSeconds != null) {
+  if (cycleDuration && resetInfo.resetsInSeconds != null) {
     const paceData = calculatePace({
-      usagePercent: percentUsed,
-      resetsInSeconds,
+      usagePercent: percentages.percentUsed,
+      resetsInSeconds: resetInfo.resetsInSeconds,
       cycleDurationSeconds: cycleDuration,
     });
     if (paceData) entry.pace = paceData;
   }
 
   return entry;
+}
+
+function parsePercentages(limit) {
+  const usedValue = toFiniteNumber(limit.usedPercent ?? limit.percentUsed);
+  const leftValue = toFiniteNumber(limit.percentLeft ?? limit.remaining ?? limit.percent);
+  if (usedValue === null && leftValue === null) return null;
+
+  const percentUsed = usedValue ?? (100 - leftValue);
+  return {
+    percentUsed,
+    percentLeft: leftValue ?? (100 - percentUsed),
+  };
+}
+
+function parseRpcResetInfo(limit, context) {
+  const resetsAt = limit.resetsAt || limit.resetAt || limit.reset || null;
+  const suppliedSeconds = toFiniteNumber(limit.resetsInSeconds ?? limit.secondsUntilReset);
+  if (suppliedSeconds !== null) {
+    return { resetsAt, resetsIn: formatDuration(suppliedSeconds), resetsInSeconds: suppliedSeconds };
+  }
+  if (isUnixTimestamp(resetsAt)) return parseUnixResetTime(resetsAt);
+
+  const parsed = resetsAt && context.parseResetTime ? context.parseResetTime(resetsAt) : null;
+  return {
+    resetsAt,
+    resetsIn: parsed?.text || null,
+    resetsInSeconds: parsed?.seconds ?? null,
+  };
+}
+
+function parseUnixResetTime(resetsAt) {
+  const timestamp = Number(resetsAt);
+  const resetTimeMs = timestamp < 1e12 ? timestamp * 1000 : timestamp;
+  const resetsInSeconds = Math.max(0, Math.floor((resetTimeMs - Date.now()) / 1000));
+  return {
+    resetsAt,
+    resetsIn: resetsInSeconds === 0 ? 'soon' : formatDuration(resetsInSeconds),
+    resetsInSeconds,
+  };
+}
+
+function isUnixTimestamp(value) {
+  if (typeof value === 'number') return Number.isFinite(value);
+  return typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim());
+}
+
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
 }
 
 /**

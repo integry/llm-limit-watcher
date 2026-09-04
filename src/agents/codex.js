@@ -13,6 +13,7 @@ const {
   extractMetadataFromOutput,
 } = require('./codex-pty-helpers.js');
 const { pingKeepalive } = require('./keepalive-helper.js');
+const { version: packageVersion } = require('../../package.json');
 
 class CodexAgent extends BaseAgent {
   constructor() {
@@ -55,7 +56,7 @@ class CodexAgent extends BaseAgent {
       this._rpcClient = null;
     }
 
-    this._rpcClient = new JsonRpcClient('codex', ['-s', 'read-only', '-a', 'untrusted', 'app-server'], {
+    this._rpcClient = new JsonRpcClient('codex', ['app-server'], {
       cwd: '/tmp',
       timeout: this.getTimeout(),
     });
@@ -63,6 +64,15 @@ class CodexAgent extends BaseAgent {
     try {
       await this._rpcClient.start();
       console.log(`[${this.name}] JSON-RPC server started`);
+
+      await this._rpcClient.call('initialize', {
+        clientInfo: {
+          name: 'agent_tank',
+          title: 'Agent Tank',
+          version: packageVersion,
+        },
+      });
+      this._rpcClient.notify('initialized', {});
 
       const rateLimits = await this._rpcClient.call('account/rateLimits/read', {});
       console.log(`[${this.name}] Received rate limits via JSON-RPC:`, JSON.stringify(rateLimits));

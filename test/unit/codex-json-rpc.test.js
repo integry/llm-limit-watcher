@@ -17,6 +17,7 @@ jest.mock('../../src/json-rpc-client.js', () => {
   const mockClient = {
     start: jest.fn(),
     call: jest.fn(),
+    notify: jest.fn(),
     stop: jest.fn(),
     isConnected: true,
   };
@@ -36,6 +37,8 @@ jest.mock('../../src/json-rpc-client.js', () => {
 
 const { CodexAgent } = require('../../src/agents/codex.js');
 const { JsonRpcClient, __mockClient } = require('../../src/json-rpc-client.js');
+const { version: packageVersion } = require('../../package.json');
+const { formatCodexUsage } = require('../../src/usage-formatters.js');
 const {
   formatRpcResponseAsOutput,
   parseRpcRateLimits,
@@ -49,6 +52,7 @@ describe('CodexAgent JSON-RPC Integration', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     __mockClient.start.mockResolvedValue();
+    __mockClient.notify.mockClear();
     __mockClient.stop.mockClear();
     __mockClient.isConnected = true;
 
@@ -72,10 +76,18 @@ describe('CodexAgent JSON-RPC Integration', () => {
 
       expect(JsonRpcClient).toHaveBeenCalledWith(
         'codex',
-        ['-s', 'read-only', '-a', 'untrusted', 'app-server'],
+        ['app-server'],
         expect.objectContaining({ timeout: 25000 })
       );
       expect(__mockClient.start).toHaveBeenCalled();
+      expect(__mockClient.call).toHaveBeenNthCalledWith(1, 'initialize', {
+        clientInfo: {
+          name: 'agent_tank',
+          title: 'Agent Tank',
+          version: packageVersion,
+        },
+      });
+      expect(__mockClient.notify).toHaveBeenCalledWith('initialized', {});
       expect(__mockClient.call).toHaveBeenCalledWith('account/rateLimits/read', {});
       expect(result).toBe('__RPC_RESPONSE__');
     });
@@ -218,6 +230,82 @@ describe('CodexAgent JSON-RPC Integration', () => {
   });
 
   describe('parseRpcRateLimits', () => {
+    it('maps a Pro account weekly-only primary window without inventing a session limit', () => {
+      const resetsAt = Math.floor(Date.now() / 1000) + 86400;
+      const response = {
+        rateLimits: {
+          limitId: 'codex',
+          primary: { usedPercent: 82, windowDurationMins: 10080, resetsAt },
+          secondary: null,
+          planType: 'pro',
+        },
+      };
+
+      const { usage, metadataUpdates } = parseRpcRateLimits(response);
+
+      expect(usage.fiveHour).toBeNull();
+      expect(usage.weekly.percentUsed).toBe(82);
+      expect(usage.weekly.percentLeft).toBe(18);
+      expect(usage.weekly.windowDurationMins).toBe(10080);
+      expect(usage.weekly.resetsInSeconds).toBeGreaterThan(86000);
+      expect(metadataUpdates.planType).toBe('pro');
+    });
+
+    it('renders a Pro weekly-only bucket without a 5h usage row', () => {
+      const response = {
+        rateLimits: {
+          limitId: 'codex',
+          primary: {
+            usedPercent: 82,
+            windowDurationMins: 10080,
+            resetsAt: Math.floor(Date.now() / 1000) + 86400,
+          },
+          secondary: null,
+          planType: 'pro',
+        },
+      };
+
+      const { usage } = parseRpcRateLimits(response);
+      const html = formatCodexUsage(usage);
+
+      expect(html).toContain('Weekly');
+      expect(html).toContain('data-percent="82"');
+      expect(html).not.toContain('5h limit');
+    });
+
+    it('maps current primary and secondary windows and model-specific buckets', () => {
+      const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+      const response = {
+        rateLimits: {
+          limitId: 'codex',
+          primary: { usedPercent: 12, windowDurationMins: 300, resetsAt },
+          secondary: { usedPercent: 34, windowDurationMins: 10080, resetsAt },
+        },
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            primary: { usedPercent: 12, windowDurationMins: 300, resetsAt },
+            secondary: { usedPercent: 34, windowDurationMins: 10080, resetsAt },
+          },
+          codex_spark: {
+            limitId: 'codex_spark',
+            limitName: 'GPT-5.3-Codex-Spark',
+            primary: { usedPercent: 20, windowDurationMins: 300, resetsAt },
+            secondary: { usedPercent: 45, windowDurationMins: 10080, resetsAt },
+          },
+        },
+      };
+
+      const { usage } = parseRpcRateLimits(response);
+
+      expect(usage.fiveHour.percentUsed).toBe(12);
+      expect(usage.weekly.percentUsed).toBe(34);
+      expect(usage.modelLimits).toHaveLength(1);
+      expect(usage.modelLimits[0].name).toBe('GPT-5.3-Codex-Spark');
+      expect(usage.modelLimits[0].fiveHour.percentUsed).toBe(20);
+      expect(usage.modelLimits[0].weekly.percentUsed).toBe(45);
+    });
+
     it('parses fiveHour and weekly limits', () => {
       const rateLimits = {
         fiveHour: { percentLeft: 75, resetsAt: '15:00', resetsInSeconds: 3600 },
@@ -305,6 +393,23 @@ describe('CodexAgent JSON-RPC Integration', () => {
   });
 
   describe('parseRpcLimitEntry', () => {
+    it('uses usedPercent directly for current app-server windows', () => {
+      const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+      const result = parseRpcLimitEntry(
+        { usedPercent: 82, windowDurationMins: 10080, resetsAt },
+        'Weekly limit',
+        'weekly'
+      );
+
+      expect(result.percentUsed).toBe(82);
+      expect(result.percentLeft).toBe(18);
+      expect(result.resetsInSeconds).toBeGreaterThan(3500);
+    });
+
+    it('does not turn a window with no percentage into 0% usage', () => {
+      expect(parseRpcLimitEntry({}, '5h limit', 'fiveHour')).toBeNull();
+    });
+
     it('parses limit with percentLeft', () => {
       const limit = { percentLeft: 75, resetsAt: '15:00' };
       const result = parseRpcLimitEntry(limit, '5h limit', 'fiveHour');
@@ -366,6 +471,24 @@ describe('CodexAgent JSON-RPC Integration', () => {
   });
 
   describe('formatRpcResponseAsOutput', () => {
+    it('preserves the full current response including model-specific buckets', () => {
+      const response = {
+        rateLimits: {
+          limitId: 'codex',
+          primary: { usedPercent: 82, windowDurationMins: 10080 },
+          secondary: null,
+        },
+        rateLimitsByLimitId: {
+          codex: { limitId: 'codex', primary: { usedPercent: 82 } },
+        },
+      };
+
+      expect(formatRpcResponseAsOutput(response)).toEqual({
+        marker: '__RPC_RESPONSE__',
+        data: response,
+      });
+    });
+
     it('returns marker for structured response with fiveHour', () => {
       const rateLimits = { fiveHour: { percentLeft: 80 } };
       const result = formatRpcResponseAsOutput(rateLimits);
